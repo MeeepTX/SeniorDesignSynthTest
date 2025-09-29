@@ -1,0 +1,359 @@
+# Live FFT viewer (PyQt6 + pyqtgraph >= 0.13)
+# Keys:
+#   Space  - pause/resume
+#   L      - toggle frequency axis log-x <-> linear-x
+#   M      - toggle FFT Y-axis autoscale <-> preset range
+#   I      - choose input device (mic) from a popup, switches live
+#
+# Command-line:
+#   python livefft.py --device 1         # start with device index 1
+#   python livefft.py --choose-device    # prompt at launch
+#
+# Frequency view fixed to 20 Hz .. 20 kHz
+# Axis labels include units
+
+import sys
+import threading
+import argparse
+import numpy as np
+
+# SciPy is optional (for time-domain LPF if enabled)
+try:
+    from scipy.signal import filtfilt, butter
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+import pyaudio
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+
+# ---------- Utility: list input devices ----------
+def list_input_devices(pa: pyaudio.PyAudio):
+    """Return list of (index, name, maxInputChannels) for devices with input channels."""
+    devices = []
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if int(info.get("maxInputChannels", 0)) > 0:
+            devices.append((i, info["name"], int(info["maxInputChannels"])))
+    return devices
+
+
+class Recorder:
+    """Simple microphone reader using PyAudio, with device switching."""
+
+    def __init__(self, fs=44100, chunk_size=4096, channels=1, device_index=None):
+        self.fs = fs
+        self.chunk_size = chunk_size
+        self.channels = channels
+        self.device_index = device_index
+
+        self._pa = pyaudio.PyAudio()
+        self._stream = None
+        self._lock = threading.Lock()
+        self._latest = np.zeros(self.chunk_size, dtype=np.float32)
+        self._running = False
+
+    # ----- stream control -----
+    def start(self):
+        if self._running:
+            return
+        self._open_stream()
+        self._running = True
+
+        def _reader():
+            while self._running:
+                try:
+                    data = self._stream.read(self.chunk_size, exception_on_overflow=False)
+                    arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    if self.channels > 1:
+                        arr = arr.reshape(-1, self.channels).mean(axis=1)
+                    with self._lock:
+                        self._latest = arr
+                except Exception:
+                    # Ignore transient device errors and continue
+                    pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+        self._close_stream()
+
+    def terminate(self):
+        self.stop()
+        try:
+            self._pa.terminate()
+        except Exception:
+            pass
+
+    def change_device(self, new_index: int):
+        """Switch to a different input device (by index) while running."""
+        was_running = self._running
+        self.stop()
+        self.device_index = new_index
+        if was_running:
+            self.start()
+
+    def latest_chunk(self):
+        with self._lock:
+            return self._latest.copy()
+
+    # ----- internals -----
+    def _open_stream(self):
+        fmt = pyaudio.paInt16  # widely supported
+        kwargs = dict(
+            format=fmt,
+            channels=self.channels,
+            rate=self.fs,
+            input=True,
+            frames_per_buffer=self.chunk_size,
+        )
+        if self.device_index is not None:
+            kwargs["input_device_index"] = int(self.device_index)
+        self._stream = self._pa.open(**kwargs)
+
+    def _close_stream(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+
+class LiveFFTWindow(pg.GraphicsLayoutWidget):
+    """Main window with time plot (top) and spectrum plot (bottom)."""
+
+    def __init__(self, recorder: Recorder, plot_update_hz=30, choose_device_on_start=False, parent=None):
+        super().__init__(parent=parent)
+        self.setWindowTitle("Live FFT")
+
+        self.recorder = recorder
+        self.plot_update_hz = plot_update_hz
+
+        # Frequency display limits (audible band)
+        self.MIN_FREQ = 20.0
+        self.MAX_FREQ = 20000.0
+
+        # Preset Y-range for FFT magnitude (linear)
+        self.PRESET_MAG_MIN = 0.0
+        self.PRESET_MAG_MAX = 0.05
+
+        # State flags
+        self._paused = False
+        self._fft_logx = False          # start linear-x
+        self._fft_autoscale_y = True    # start with Y autoscaling
+
+        self._build_plots()
+
+        # Plot update timer
+        self.timer = QtCore.QTimer(self)
+        interval_ms = int(round(1000.0 / self.plot_update_hz))
+        print(f"Updating graphs every {interval_ms:.1f} ms")
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self.update_plots)
+        self.timer.start()
+
+        # Optional time-domain low-pass filter (disabled by default)
+        self._use_time_filter = False  # set True to enable (requires SciPy)
+        if _HAVE_SCIPY and self._use_time_filter:
+            nyq = 0.5 * self.recorder.fs
+            cutoff = 5000.0
+            self._b, self._a = butter(4, cutoff / nyq, btype="low")
+        else:
+            self._b = self._a = None
+
+        # Optionally prompt to choose device at startup
+        if choose_device_on_start:
+            QtCore.QTimer.singleShot(0, self._choose_input_device)
+
+    # ---------- UI construction ----------
+    def _build_plots(self):
+        # Time-domain plot
+        self.time_plot = self.addPlot(row=0, col=0, title="Time Signal")
+        self.time_plot.setLabel("bottom", "Time (samples)")
+        self.time_plot.setLabel("left", "Amplitude (linear)")
+        self.time_curve = self.time_plot.plot(pen=pg.mkPen(width=1))
+        self.time_plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+
+        # Frequency-domain plot
+        self.fft_plot = self.addPlot(row=1, col=0, title="Spectrum (FFT)")
+        self.fft_plot.setLabel("bottom", "Frequency (Hz)")
+        self.fft_plot.setLabel("left", "Magnitude (linear)")
+        self.fft_curve = self.fft_plot.plot(pen=pg.mkPen(width=1))
+
+        # Start linear-x; allow toggle to log-x with 'L'
+        self.fft_plot.setLogMode(x=False, y=False)
+
+        # Set initial Y behavior (autoscale vs preset)
+        self._apply_fft_y_mode()
+
+        # Fix visible frequency band (20 Hz .. 20 kHz)
+        self._apply_x_range()
+
+        # On-screen help label (row 2)
+        self.help_label = pg.LabelItem(justify='left')
+        self.addItem(self.help_label, row=2, col=0)
+        self._update_help_label()
+
+    # ---------- Helpers to apply ranges/modes ----------
+    def _apply_x_range(self):
+        """Apply [20 Hz, 20 kHz] in the correct coordinate system (linear vs log10)."""
+        vb = self.fft_plot.getViewBox()
+        if self._fft_logx:
+            vb.setRange(xRange=(np.log10(self.MIN_FREQ), np.log10(self.MAX_FREQ)), padding=0)
+        else:
+            vb.setRange(xRange=(self.MIN_FREQ, self.MAX_FREQ), padding=0)
+
+    def _apply_fft_y_mode(self):
+        """Enable/disable autoscale and set preset Y-range if needed."""
+        if self._fft_autoscale_y:
+            self.fft_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        else:
+            self.fft_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+            self.fft_plot.setYRange(self.PRESET_MAG_MIN, self.PRESET_MAG_MAX, padding=0)
+
+    def _device_label(self):
+        """Return the current input device label."""
+        try:
+            pa = self.recorder._pa
+            if self.recorder.device_index is None:
+                # Try to fetch default input device info
+                def_idx = pa.get_default_input_device_info().get("index", None)
+                if def_idx is None:
+                    return "Default"
+                name = pa.get_device_info_by_index(def_idx)["name"]
+                return f"Default ({name})"
+            info = pa.get_device_info_by_index(int(self.recorder.device_index))
+            return f"#{self.recorder.device_index} {info['name']}"
+        except Exception:
+            return "Unknown"
+
+    def _update_help_label(self):
+        mode_x = "log-x" if self._fft_logx else "linear-x"
+        paused = "paused" if self._paused else "running"
+        y_mode = "auto-Y" if self._fft_autoscale_y else f"preset-Y [{self.PRESET_MAG_MIN:g}..{self.PRESET_MAG_MAX:g}]"
+        dev = self._device_label()
+        self.help_label.setText(
+            "<span style='font-size:12pt;'>"
+            "<b>Keys:</b> <b>L</b> log-x, <b>M</b> Y auto/preset, <b>I</b> choose input, <b>Space</b> pause/resume"
+            f" &nbsp;&nbsp;|&nbsp;&nbsp; <b>Mode:</b> {mode_x}, {y_mode}"
+            f" &nbsp;&nbsp;|&nbsp;&nbsp; <b>Status:</b> {paused}"
+            f" &nbsp;&nbsp;|&nbsp;&nbsp; <b>Band:</b> {int(self.MIN_FREQ)}–{int(self.MAX_FREQ)} Hz"
+            f" &nbsp;&nbsp;|&nbsp;&nbsp; <b>Input:</b> {dev}"
+            "</span>"
+        )
+
+    # ---------- Events ----------
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == QtCore.Qt.Key.Key_L:
+            self._fft_logx = not self._fft_logx
+            self.fft_plot.setLogMode(x=self._fft_logx, y=False)
+            self._apply_x_range()
+            print(f"Spectrum X-axis set to {'log-x' if self._fft_logx else 'linear-x'} (20 Hz – 20 kHz)")
+            self._update_help_label()
+        elif key == QtCore.Qt.Key.Key_M:
+            self._fft_autoscale_y = not self._fft_autoscale_y
+            self._apply_fft_y_mode()
+            print("FFT Y-axis set to " + ("autoscale" if self._fft_autoscale_y else f"preset [{self.PRESET_MAG_MIN}..{self.PRESET_MAG_MAX}]"))
+            self._update_help_label()
+        elif key == QtCore.Qt.Key.Key_I:
+            self._choose_input_device()
+        elif key == QtCore.Qt.Key.Key_Space:
+            self._paused = not self._paused
+            print("Paused" if self._paused else "Resumed")
+            self._update_help_label()
+        else:
+            super().keyPressEvent(event)
+
+    def _choose_input_device(self):
+        """Popup dialog to pick an input device; switches the Recorder live."""
+        pa = self.recorder._pa
+        devs = list_input_devices(pa)
+        if not devs:
+            QtWidgets.QMessageBox.warning(self, "No inputs", "No input (microphone) devices were found.")
+            return
+
+        labels = [f"#{i} {name} (ch:{ch})" for i, name, ch in devs]
+        # Preselect current
+        current_idx = 0
+        if self.recorder.device_index is not None:
+            for k, (i, _, _) in enumerate(devs):
+                if int(i) == int(self.recorder.device_index):
+                    current_idx = k
+                    break
+
+        item, ok = QtWidgets.QInputDialog.getItem(self, "Choose Input Device", "Device:", labels, current_idx, False)
+        if not ok or not item:
+            return
+
+        # Parse out index from label like "#3 Mic (ch:2)"
+        try:
+            new_index = int(item.split()[0].lstrip("#"))
+        except Exception:
+            return
+
+        print(f"Switching input to device #{new_index} ...")
+        self.recorder.change_device(new_index)
+        self._update_help_label()
+
+    # ---------- Plot update ----------
+    def update_plots(self):
+        if self._paused:
+            return
+
+        x = self.recorder.latest_chunk()
+        if x.size == 0:
+            return
+
+        # Optional time filter
+        if _HAVE_SCIPY and self._use_time_filter and self._b is not None:
+            try:
+                x = filtfilt(self._b, self._a, x)
+            except Exception:
+                pass
+
+        # Time plot
+        self.time_curve.setData(x)
+
+        # FFT with Hann window
+        win = np.hanning(len(x))
+        xw = x * win
+        X = np.fft.rfft(xw)
+        mag = np.abs(X) / (len(xw) / 2.0)
+        freqs = np.fft.rfftfreq(len(xw), d=1.0 / self.recorder.fs)
+
+        # Restrict to audible band (also avoids 0 Hz in log-x)
+        mask = (freqs >= self.MIN_FREQ) & (freqs <= self.MAX_FREQ)
+        self.fft_curve.setData(freqs[mask], mag[mask])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Live FFT (PyQtGraph + PyAudio)")
+    parser.add_argument("--device", type=int, default=None, help="Input device index (from PyAudio)")
+    parser.add_argument("--choose-device", action="store_true", help="Prompt to choose input device at startup")
+    parser.add_argument("--fs", type=int, default=44100, help="Sample rate (Hz)")
+    parser.add_argument("--chunk", type=int, default=4096, help="Frames per buffer (FFT size)")
+    parser.add_argument("--channels", type=int, default=1, help="Number of input channels (will be averaged if >1)")
+    args = parser.parse_args()
+
+    app = QtWidgets.QApplication(sys.argv)
+
+    rec = Recorder(fs=args.fs, chunk_size=args.chunk, channels=args.channels, device_index=args.device)
+    rec.start()
+
+    win = LiveFFTWindow(recorder=rec, plot_update_hz=30, choose_device_on_start=args.choose_device)
+    win.resize(900, 720)
+    win.show()
+
+    ret = app.exec()
+    rec.terminate()
+    sys.exit(ret)
+
+
+if __name__ == "__main__":
+    main()
